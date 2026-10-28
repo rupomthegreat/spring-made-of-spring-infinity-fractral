@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Infinite Hyperhelix</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#05060a; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color:#e8ecf5;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
+  canvas.dragging { cursor:grabbing; }
+
+  #title { position:fixed; top:14px; left:16px; pointer-events:none; }
+  #title h1 { font-size:14px; font-weight:700; letter-spacing:.22em; opacity:.85; }
+  #title p { font-size:11.5px; opacity:.42; margin-top:5px; max-width:230px; line-height:1.5; }
+
+  #hint { position:fixed; top:14px; right:16px; font-size:11px; opacity:.35; text-align:right; line-height:1.6; pointer-events:none; }
+
+  #ui {
+    position:fixed; left:12px; right:12px; bottom:12px;
+    display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+    pointer-events:none;
+  }
+  .panel {
+    pointer-events:auto;
+    background:rgba(14,18,30,.72);
+    border:1px solid rgba(120,160,255,.16);
+    backdrop-filter:blur(12px);
+    -webkit-backdrop-filter:blur(12px);
+    border-radius:12px;
+    padding:7px 11px;
+    display:flex; gap:9px; align-items:center;
+    box-shadow:0 10px 34px rgba(0,0,0,.55);
+  }
+  button {
+    font:inherit; font-size:12px; color:#dfe7ff;
+    background:rgba(90,130,255,.13);
+    border:1px solid rgba(120,160,255,.24);
+    border-radius:8px; padding:6px 11px; cursor:pointer;
+    transition: background .15s, transform .08s;
+    white-space:nowrap;
+  }
+  button:hover { background:rgba(110,150,255,.26); }
+  button:active { transform:scale(.95); }
+  input[type=range] { width:84px; accent-color:#6ea8ff; cursor:pointer; }
+  .lbl { opacity:.65; font-size:11px; letter-spacing:.05em; }
+
+  #loading {
+    position:fixed; inset:0; display:grid; place-items:center;
+    background:#05060a; font-size:12px; letter-spacing:.15em; opacity:.55;
+    transition:opacity .5s; pointer-events:none;
+  }
+  #loading.gone { opacity:0; }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div id="title">
+  <h1>INFINITE HYPERHELIX</h1>
+  <p>A wire becomes a spring, forever.</p>
+</div>
+
+<div id="hint">
+  drag — rotate<br>
+  wheel / pinch — zoom<br>
+  double-click — fullscreen
+</div>
+
+<div id="ui">
+  <div class="panel">
+    <span class="lbl">Thickness</span>
+    <input id="thickness" type="range" min="0.5" max="4.0" step="0.1" value="1.2">
+  </div>
+  <div class="panel" style="margin-left:auto;">
+    <button id="autoZoom" style="background:rgba(80,220,120,.2); border-color:rgba(80,220,120,.4);">Auto Zoom</button>
+    <button id="reset">Reset</button>
+    <button id="fs">Fullscreen</button>
+  </div>
+</div>
+
+<div id="loading">BUILDING…</div>
+
+<script>
+(function () {
+'use strict';
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', {
+  antialias: true, alpha: false, depth: true, powerPreference: 'high-performance'
+}) || canvas.getContext('experimental-webgl');
+
+if (!gl) {
+  document.getElementById('loading').textContent = 'WEBGL NOT AVAILABLE';
+  return;
+}
+
+const VS = `
+attribute vec3 a_pos;
+attribute vec3 a_next;
+attribute vec3 a_col;
+attribute float a_side;
+
+uniform mat4 u_mvp;
+uniform vec2 u_resolution;
+uniform float u_thickness;
+uniform vec3 u_camPos;
+
+varying vec3 v_col;
+varying float v_dist;
+
+void main() {
+  v_col = a_col;
+  v_dist = length(a_pos - u_camPos);
+
+  vec4 clipPos = u_mvp * vec4(a_pos, 1.0);
+  vec4 clipNext = u_mvp * vec4(a_next, 1.0);
+  
+  vec3 ndcPos = clipPos.xyz / clipPos.w;
+  vec3 ndcNext = clipNext.xyz / clipNext.w;
+  
+  vec2 screenPos = ndcPos.xy * u_resolution * 0.5;
+  vec2 screenNext = ndcNext.xy * u_resolution * 0.5;
+  
+  vec2 dir = screenNext - screenPos;
+  if (length(dir) < 0.0001) dir = vec2(0.0, 1.0);
+  dir = normalize(dir);
+  
+  vec2 normal = vec2(-dir.y, dir.x);
+  vec2 offset = normal * u_thickness * 2.0 / u_resolution;
+  
+  clipPos.xy += offset * clipPos.w * a_side;
+  
+  gl_Position = clipPos;
+}`;
+
+const FS = `
+precision mediump float;
+varying vec3 v_col;
+varying float v_dist;
+uniform float u_fogNear;
+uniform float u_fogFar;
+uniform vec3  u_bg;
+void main() {
+  float f = clamp((v_dist - u_fogNear) / max(u_fogFar - u_fogNear, 1e-6), 0.0, 1.0);
+  vec3 c = mix(v_col, u_bg, f * 0.9);
+  gl_FragColor = vec4(c, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  return s;
+}
+function makeProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  return p;
+}
+
+const prog  = makeProgram(VS, FS);
+const aPos  = gl.getAttribLocation(prog, 'a_pos');
+const aNext = gl.getAttribLocation(prog, 'a_next');
+const aCol  = gl.getAttribLocation(prog, 'a_col');
+const aSide = gl.getAttribLocation(prog, 'a_side');
+
+const uMvp   = gl.getUniformLocation(prog, 'u_mvp');
+const uCam   = gl.getUniformLocation(prog, 'u_camPos');
+const uRes   = gl.getUniformLocation(prog, 'u_resolution');
+const uThick = gl.getUniformLocation(prog, 'u_thickness');
+const uFogN  = gl.getUniformLocation(prog, 'u_fogNear');
+const uFogF  = gl.getUniformLocation(prog, 'u_fogFar');
+const uBg    = gl.getUniformLocation(prog, 'u_bg');
+
+const BG = [0.0196, 0.0235, 0.0392];
+const vbo = gl.createBuffer();
+
+function mat4Perspective(out, fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  out[0] = f / aspect; out[1] = 0; out[2] = 0;  out[3] = 0;
+  out[4] = 0; out[5] = f; out[6] = 0;  out[7] = 0;
+  out[8] = 0; out[9] = 0; out[10] = (far + near) / (near - far); out[11] = -1;
+  out[12] = 0; out[13] = 0; out[14] = (2 * far * near) / (near - far); out[15] = 0;
+}
+function mat4LookAt(out, eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz) || 1;
+  zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy;
+  let xy = up[2] * zx - up[0] * zz;
+  let xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz);
+  if (l < 1e-7) { xx = 1; xy = 0; xz = 0; l = 1; }
+  xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  out[0] = xx; out[1] = yx; out[2] = zx; out[3] = 0;
+  out[4] = xy; out[5] = yy; out[6] = zy; out[7] = 0;
+  out[8] = xz; out[9] = yz; out[10] = zz; out[11] = 0;
+  out[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]);
+  out[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]);
+  out[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]);
+  out[15] = 1;
+}
+function mat4Mul(out, a, b) {
+  for (let i = 0; i < 4; i++) {
+    const b0 = b[i * 4], b1 = b[i * 4 + 1], b2 = b[i * 4 + 2], b3 = b[i * 4 + 3];
+    out[i * 4]     = a[0] * b0 + a[4] * b1 + a[8]  * b2 + a[12] * b3;
+    out[i * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9]  * b2 + a[13] * b3;
+    out[i * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+    out[i * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
+  }
+}
+
+function hsv2rgb(h, s, v, out) {
+  h = h - Math.floor(h);
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: out[0] = v; out[1] = t; out[2] = p; break;
+    case 1: out[0] = q; out[1] = v; out[2] = p; break;
+    case 2: out[0] = p; out[1] = v; out[2] = t; break;
+    case 3: out[0] = p; out[1] = q; out[2] = v; break;
+    case 4: out[0] = t; out[1] = p; out[2] = v; break;
+    default: out[0] = v; out[1] = p; out[2] = q; break;
+  }
+}
+
+const cam = { theta: 0.6, phi: 1.3, dist: 250, tx: 0, ty: 0, tz: 0 };
+const eye = [0, 0, 0];
+const MIN_DIST = 1e-6, MAX_DIST = 1e6;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+
+function updateEye() {
+  const sp = Math.sin(cam.phi), cp = Math.cos(cam.phi);
+  const st = Math.sin(cam.theta), ct = Math.cos(cam.theta);
+  eye[0] = cam.tx + cam.dist * sp * st;
+  eye[1] = cam.ty + cam.dist * cp;
+  eye[2] = cam.tz + cam.dist * sp * ct;
+}
+
+// Fractal Engine
+const MAX_POINTS = 200000;
+const MAX_DEPTH = 16;
+let renderData = new Float32Array(MAX_POINTS * 20); 
+let vertexCount = 0;
+let rawPoints = [];
+let localOrigin = [0, 0, 0];
+let eyeLocal = [0, 0, 0];
+let targetLocal = [0, 0, 0];
+
+function generateFractal() {
+  rawPoints = [];
+  localOrigin = [cam.tx, cam.ty, cam.tz];
+  eyeLocal = [eye[0] - localOrigin[0], eye[1] - localOrigin[1], eye[2] - localOrigin[2]];
+  
+  const p0 = [-150, 0, 0];
+  const p1 = [150, 0, 0];
+  const N0 = [0, 1, 0];
+  const B0 = [0, 0, 1];
+  
+  subdivide(p0, p1, N0, B0, 0, 0.0);
+  
+  let vIdx = 0;
+  const n = rawPoints.length;
+  if (n < 2) return;
+  
+  for (let i = 0; i < n; i++) {
+    const cur = rawPoints[i];
+    const nxt = rawPoints[Math.min(i + 1, n - 1)];
+    
+    const tmp = [0,0,0];
+    const hue = (cur[3] * 2.0) % 1.0; 
+    hsv2rgb(hue, 0.85, 1.0, tmp);
+    
+    const cx = cur[0] - localOrigin[0];
+    const cy = cur[1] - localOrigin[1];
+    const cz = cur[2] - localOrigin[2];
+    
+    const nx = nxt[0] - localOrigin[0];
+    const ny = nxt[1] - localOrigin[1];
+    const nz = nxt[2] - localOrigin[2];
+    
+    // Left
+    renderData[vIdx++] = cx; renderData[vIdx++] = cy; renderData[vIdx++] = cz;
+    renderData[vIdx++] = nx; renderData[vIdx++] = ny; renderData[vIdx++] = nz;
+    renderData[vIdx++] = tmp[0]; renderData[vIdx++] = tmp[1]; renderData[vIdx++] = tmp[2];
+    renderData[vIdx++] = -1.0;
+    
+    // Right
+    renderData[vIdx++] = cx; renderData[vIdx++] = cy; renderData[vIdx++] = cz;
+    renderData[vIdx++] = nx; renderData[vIdx++] = ny; renderData[vIdx++] = nz;
+    renderData[vIdx++] = tmp[0]; renderData[vIdx++] = tmp[1]; renderData[vIdx++] = tmp[2];
+    renderData[vIdx++] = 1.0;
+  }
+  
+  vertexCount = n * 2;
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, renderData.subarray(0, vIdx), gl.DYNAMIC_DRAW);
+}
+
+function subdivide(p0, p1, N, B, depth, u0) {
+  if (rawPoints.length > MAX_POINTS) return;
+  
+  const vx = p1[0] - p0[0], vy = p1[1] - p0[1], vz = p1[2] - p0[2];
+  const length = Math.hypot(vx, vy, vz);
+  
+  // Point-to-segment distance calculation for precise culling
+  const wx = cam.tx - p0[0], wy = cam.ty - p0[1], wz = cam.tz - p0[2];
+  const c1 = vx*wx + vy*wy + vz*wz;
+  let distToSeg;
+  
+  if (c1 <= 0) {
+    distToSeg = Math.hypot(wx, wy, wz);
+  } else {
+    const c2 = vx*vx + vy*vy + vz*vz;
+    if (c2 <= c1) {
+      distToSeg = Math.hypot(cam.tx - p1[0], cam.ty - p1[1], cam.tz - p1[2]);
+    } else {
+      const b = c1 / c2;
+      distToSeg = Math.hypot(wx - b*vx, wy - b*vy, wz - b*vz);
+    }
+  }
+
+  // Cull anything that is far away from the camera
+  if (distToSeg > cam.dist * 8.0) {
+    addLine(p0, p1, u0, u0);
+    return;
+  }
+
+  // Subdivide if it's big on screen
+  if (depth >= MAX_DEPTH || length / Math.max(distToSeg, 1e-6) < 0.005) {
+    addLine(p0, p1, u0, u0 + 0.01);
+    return;
+  }
+
+  const T = [vx/length, vy/length, vz/length];
+  const dotNT = N[0]*T[0] + N[1]*T[1] + N[2]*T[2];
+  let Np = [N[0]-T[0]*dotNT, N[1]-T[1]*dotNT, N[2]-T[2]*dotNT];
+  const lN = Math.hypot(Np[0], Np[1], Np[2]) || 1;
+  Np[0]/=lN; Np[1]/=lN; Np[2]/=lN;
+
+  const Bp = [
+    T[1]*Np[2] - T[2]*Np[1],
+    T[2]*Np[0] - T[0]*Np[2],
+    T[0]*Np[1] - T[1]*Np[0]
+  ];
+
+  const turns = 4; 
+  const r = length * 0.15; 
+  const steps = 64; // Higher steps for perfectly smooth coils
+  
+  let prev = p0;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const base = [p0[0] + vx*t, p0[1] + vy*t, p0[2] + vz*t];
+    const ang = t * Math.PI * 2 * turns;
+    const pt = [
+      base[0] + Np[0] * Math.cos(ang) * r + Bp[0] * Math.sin(ang) * r,
+      base[1] + Np[1] * Math.cos(ang) * r + Bp[1] * Math.sin(ang) * r,
+      base[2] + Np[2] * Math.cos(ang) * r + Bp[2] * Math.sin(ang) * r
+    ];
+    
+    const u1 = u0 + (t / steps) * 0.05;
+    subdivide(prev, pt, Np, Bp, depth + 1, u1);
+    prev = pt;
+  }
+}
+
+function addLine(p0, p1, u0, u1) {
+  if (rawPoints.length === 0) {
+    rawPoints.push([p0[0], p0[1], p0[2], u0]);
+  } else {
+    const last = rawPoints[rawPoints.length-1];
+    if (Math.hypot(last[0]-p0[0], last[1]-p0[1], last[2]-p0[2]) > 1e-7) {
+      rawPoints.push([p0[0], p0[1], p0[2], u0]);
+    }
+  }
+  rawPoints.push([p1[0], p1[1], p1[2], u1]);
+}
+
+// Auto-Zoom Animation
+let isAutoZooming = false;
+let zoomTarget = [0, 0, 0];
+let zoomStartTx = 0, zoomStartTy = 0, zoomStartTz = 0;
+let zoomStartDist = 0;
+let zoomProgress = 0;
+
+function startAutoZoom() {
+  if (rawPoints.length === 0) return;
+  
+  // Pick a point from the generated wire to fly into
+  const idx = Math.floor(rawPoints.length * 0.45 + Math.random() * rawPoints.length * 0.1);
+  const pt = rawPoints[idx];
+  
+  zoomTarget = [pt[0], pt[1], pt[2]];
+  
+  zoomStartTx = cam.tx; zoomStartTy = cam.ty; zoomStartTz = cam.tz;
+  zoomStartDist = cam.dist;
+  zoomProgress = 0;
+  isAutoZooming = true;
+}
+
+// Interaction
+const pointers = new Map();
+let prevPinch = 0;
+let prevMid = { x: 0, y: 0 };
+let lastCamState = "";
+let needsRebuild = true;
+let currentThickness = 1.2;
+
+const thicknessSlider = document.getElementById('thickness');
+
+function syncPointerBaselines() { pointers.forEach(p => { p.px = p.x; p.py = p.y; }); }
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, px: e.clientX, py: e.clientY });
+  syncPointerBaselines();
+  if (pointers.size === 1) canvas.classList.add('dragging');
+  if (pointers.size === 2) {
+    const arr = Array.from(pointers.values());
+    prevPinch = Math.hypot(arr[0].x - arr[1].x, arr[0].y - arr[1].y);
+    prevMid = { x: (arr[0].x + arr[1].x) / 2, y: (arr[0].y + arr[1].y) / 2 };
+  }
+  isAutoZooming = false;
+}, { passive: false });
+
+canvas.addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  p.px = p.x; p.py = p.y;
+  p.x = e.clientX; p.y = e.clientY;
+
+  if (pointers.size === 1) {
+    const dx = p.x - p.px, dy = p.y - p.py;
+    cam.theta -= dx * 0.006;
+    cam.phi   -= dy * 0.006;
+    cam.phi = clamp(cam.phi, 0.02, Math.PI - 0.02);
+  } else if (pointers.size === 2) {
+    const arr = Array.from(pointers.values());
+    const d = Math.hypot(arr[0].x - arr[1].x, arr[0].y - arr[1].y);
+    const mid = { x: (arr[0].x + arr[1].x) / 2, y: (arr[0].y + arr[1].y) / 2 };
+    if (prevPinch > 0 && d > 0) cam.dist = clamp(cam.dist * (prevPinch / d), MIN_DIST, MAX_DIST);
+    prevPinch = d;
+    panBy(mid.x - prevMid.x, mid.y - prevMid.y);
+    prevMid = mid;
+  }
+}, { passive: false });
+
+function endPointer(e) {
+  if (pointers.has(e.pointerId)) {
+    pointers.delete(e.pointerId);
+    syncPointerBaselines();
+  }
+  if (pointers.size === 0) canvas.classList.remove('dragging');
+  else if (pointers.size === 1) {
+    prevPinch = 0;
+    const arr = Array.from(pointers.values());
+    prevMid = { x: arr[0].x, y: arr[0].y };
+  }
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('lostpointercapture', endPointer);
+
+function panBy(dx, dy) {
+  const sp = Math.sin(cam.phi), cp = Math.cos(cam.phi);
+  const st = Math.sin(cam.theta), ct = Math.cos(cam.theta);
+  const rx = ct, ry = 0, rz = -st;
+  const ux = st * cp, uy = sp, uz = -ct * cp;
+  const scale = cam.dist * 0.0015;
+  cam.tx += (-rx * dx + ux * dy) * scale;
+  cam.ty += (-ry * dx + uy * dy) * scale;
+  cam.tz += (-rz * dx + uz * dy) * scale;
+}
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  let dy = e.deltaY;
+  if (e.deltaMode === 1) dy *= 16;
+  else if (e.deltaMode === 2) dy *= 400;
+  const f = Math.exp(dy * 0.0014);
+  cam.dist = clamp(cam.dist * f, MIN_DIST, MAX_DIST);
+  isAutoZooming = false;
+}, { passive: false });
+
+canvas.addEventListener('dblclick', toggleFullscreen);
+
+function toggleFullscreen() {
+  const el = document.documentElement;
+  const isFs = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement;
+  if (!isFs) {
+    const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+    if (req) { try { const r = req.call(el); if (r && r.catch) r.catch(() => {}); } catch (_) {} }
+  } else {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+    if (exit) { try { exit.call(document); } catch (_) {} }
+  }
+}
+
+const autoZoomBtn = document.getElementById('autoZoom');
+const resetBtn = document.getElementById('reset');
+const fsBtn = document.getElementById('fs');
+
+autoZoomBtn.addEventListener('click', () => {
+  if (!isAutoZooming) startAutoZoom();
+});
+
+resetBtn.addEventListener('click', () => {
+  cam.theta = 0.6; cam.phi = 1.3; cam.dist = 250;
+  cam.tx = 0; cam.ty = 0; cam.tz = 0;
+  needsRebuild = true;
+  isAutoZooming = false;
+});
+fsBtn.addEventListener('click', toggleFullscreen);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+  }
+}
+window.addEventListener('resize', resize);
+
+const proj = new Float32Array(16);
+const view = new Float32Array(16);
+const mvp  = new Float32Array(16);
+
+function render() {
+  resize();
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(BG[0], BG[1], BG[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  gl.disable(gl.CULL_FACE); 
+
+  if (isAutoZooming) {
+    zoomProgress += 0.012;
+    if (zoomProgress >= 1.0) {
+      zoomProgress = 1.0;
+      isAutoZooming = false;
+    }
+    
+    // Smooth easing
+    const t = zoomProgress < 0.5 ? 2 * zoomProgress * zoomProgress : 1 - Math.pow(-2 * zoomProgress + 2, 2) / 2;
+    
+    // Zoom in 20x deeper
+    cam.dist = zoomStartDist * Math.pow(0.05, t);
+    
+    cam.tx = zoomStartTx + (zoomTarget[0] - zoomStartTx) * t;
+    cam.ty = zoomStartTy + (zoomTarget[1] - zoomStartTy) * t;
+    cam.tz = zoomStartTz + (zoomTarget[2] - zoomStartTz) * t;
+  }
+
+  updateEye();
+
+  const camState = `${eye[0].toFixed(4)},${eye[1].toFixed(4)},${eye[2].toFixed(4)}`;
+  if (camState !== lastCamState || needsRebuild) {
+    generateFractal();
+    lastCamState = camState;
+    needsRebuild = false;
+  }
+
+  if (vertexCount === 0) return;
+
+  const near = Math.max(cam.dist * 0.005, 1e-8);
+  const far  = cam.dist * 150 + 2000;
+  const aspect = canvas.width / Math.max(canvas.height, 1);
+
+  targetLocal = [cam.tx - localOrigin[0], cam.ty - localOrigin[1], cam.tz - localOrigin[2]];
+
+  mat4Perspective(proj, 55 * Math.PI / 180, aspect, near, far);
+  mat4LookAt(view, eyeLocal, targetLocal, [0, 1, 0]);
+  mat4Mul(mvp, proj, view);
+
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uMvp, false, mvp);
+  gl.uniform3f(uCam, eyeLocal[0], eyeLocal[1], eyeLocal[2]);
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uThick, currentThickness * (window.devicePixelRatio || 1));
+  
+  gl.uniform1f(uFogN, cam.dist * 0.5);
+  gl.uniform1f(uFogF, cam.dist * 3.0 + 50);
+  gl.uniform3f(uBg, BG[0], BG[1], BG[2]);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  const stride = 40; 
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, stride, 0);
+  gl.enableVertexAttribArray(aNext);
+  gl.vertexAttribPointer(aNext, 3, gl.FLOAT, false, stride, 12);
+  gl.enableVertexAttribArray(aCol);
+  gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, stride, 24);
+  gl.enableVertexAttribArray(aSide);
+  gl.vertexAttribPointer(aSide, 1, gl.FLOAT, false, stride, 36);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, vertexCount);
+}
+
+thicknessSlider.addEventListener('input', () => {
+  currentThickness = parseFloat(thicknessSlider.value);
+});
+
+function loop() {
+  render();
+  requestAnimationFrame(loop);
+}
+
+resize();
+const loading = document.getElementById('loading');
+loading.classList.add('gone');
+setTimeout(() => loading.remove(), 700);
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
